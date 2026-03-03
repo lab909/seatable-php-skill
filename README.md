@@ -44,16 +44,18 @@ seatable-php/
 
 Download the latest `seatable-php.skill` from the [Releases](../../releases) page, then install it into Claude Code:
 
-```bash
-cp seatable-php.skill ~/.claude/skills/
-```
-
-Or clone this repo and symlink the skill folder directly:
+Clone this repo and symlink the skill folder directly:
 
 ```bash
-git clone https://github.com/your-username/seatable-php-skill.git
-ln -s $(pwd)/seatable-php-skill/seatable-php ~/.claude/skills/seatable-php
+git clone https://github.com/lab909/seatable-php-skill.git ~/.claude/skills/seatable-php
 ```
+Or copy the folder manually
+
+```bash
+cp -r seatable-skill ~/.claude/skills/
+```
+
+
 
 After installing, restart Claude Code (or start a new session) for the skill to become available.
 
