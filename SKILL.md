@@ -471,6 +471,8 @@ my-backend/
 
 ```
 
+Always use the Repository pattern and DTOs. Refer to the files in `examples/ContactRepository.php` and `examples/ContactDTO.php` for the required implementation style, security checks, and error handling.
+
 ---
 
 ## 13. Key Gotchas & Discoveries
