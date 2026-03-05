@@ -1,0 +1,18 @@
+# Environment variables (contains secrets — never commit)
+.env
+
+# Composer dependencies
+/vendor/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# DDEV local config (if using ddev-php skill)
+.ddev/.env

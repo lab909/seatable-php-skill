@@ -181,13 +181,31 @@ $uploadInfo = $filesApi->getUploadLink($uuid);
 //   'img_relative_path'  — subdir for images (e.g. /images/2024-01)
 
 $filePath = '/tmp/invoice.pdf';
+
+// SECURITY: Validate file exists and sanitize filename
+if (!file_exists($filePath) || !is_readable($filePath)) {
+    throw new \RuntimeException("File not found or not readable: {$filePath}");
+}
+
+// basename() strips directory traversal attempts (e.g. "../../etc/passwd" → "passwd")
 $fileName = basename($filePath);
+
+// Validate file extension against an allow-list
+$allowedExtensions = ['pdf', 'png', 'jpg', 'jpeg', 'gif', 'doc', 'docx', 'xlsx', 'csv'];
+$ext = strtolower(pathinfo($fileName, PATHINFO_EXTENSION));
+if (!in_array($ext, $allowedExtensions, true)) {
+    throw new \InvalidArgumentException("File type not allowed: .{$ext}");
+}
+
+// Choose the correct relative path based on file type
+$isImage       = in_array($ext, ['png', 'jpg', 'jpeg', 'gif'], true);
+$relativePath  = $isImage ? $uploadInfo['img_relative_path'] : $uploadInfo['file_relative_path'];
 
 // POST the file directly (SDK does not do this for you)
 (new HttpClient())->post($uploadInfo['upload_link'], [
     'multipart' => [
         ['name' => 'parent_dir',    'contents' => $uploadInfo['parent_path']],
-        ['name' => 'relative_path', 'contents' => $uploadInfo['file_relative_path']],
+        ['name' => 'relative_path', 'contents' => $relativePath],
         ['name' => 'replace',       'contents' => '1'],  // '1' = overwrite, '0' = keep both
         ['name' => 'file',          'contents' => fopen($filePath, 'r'), 'filename' => $fileName],
     ],
@@ -195,7 +213,7 @@ $fileName = basename($filePath);
 ]);
 
 // Attach to row: file columns are arrays of {name, url} objects
-$storedPath = $uploadInfo['parent_path'] . '/' . $uploadInfo['file_relative_path'] . '/' . $fileName;
+$storedPath = $uploadInfo['parent_path'] . '/' . $relativePath . '/' . $fileName;
 $rowsApi->updateRow($uuid, new UpdateRows([
     'table_name' => 'Invoices',
     'updates'    => [[
