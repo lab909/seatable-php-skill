@@ -14,10 +14,8 @@ When this skill is installed, Claude Code will know how to scaffold, connect, qu
 - Full CRUD operations on rows using the correct SDK classes and namespaces
 - SQL queries against SeaTable bases with proper `convert_keys` handling
 - File and image uploads (the full two-step signed URL flow)
-- Security guardrails: SQL injection prevention, mass assignment protection, input validation
-- Error handling with retry strategy (rate limits, token expiry)
-- Base-Token caching for production performance
-- Recommended project structure using the Repository pattern and DTOs
+- Error handling and Base-Token refresh on expiry
+- Recommended project structure using the Repository pattern
 
 ---
 
@@ -25,15 +23,10 @@ When this skill is installed, Claude Code will know how to scaffold, connect, qu
 
 ```
 seatable-php/
-├── SKILL.md                           # Core instructions loaded into Claude's context
-├── references/
-│   ├── api-endpoints.md               # Full SDK class/method reference + file upload example
-│   └── sql-limitations.md             # SeaTable SQL dialect notes and supported functions
-└── examples/
-    ├── ContactDTO.php                 # Example DTO with factory method and toArray()
-    ├── ContactRepository.php          # Full repository with CRUD, search, validation, error handling
-    ├── .env.example                   # Template for required environment variables
-    └── .gitignore                     # Ready-to-use .gitignore for SeaTable PHP projects
+├── SKILL.md                        # Core instructions loaded into Claude's context
+└── references/
+    ├── api-endpoints.md            # Full SDK class/method reference + file upload example
+    └── sql-limitations.md          # SeaTable SQL dialect notes and supported functions
 ```
 
 ---
@@ -49,17 +42,20 @@ seatable-php/
 
 ## Installation
 
-Clone this repo into your Claude Code skills directory:
+Download the latest `seatable-php.skill` from the [Releases](../../releases) page, then install it into Claude Code:
+
+Clone this repo and symlink the skill folder directly:
 
 ```bash
 git clone https://github.com/lab909/seatable-php-skill.git ~/.claude/skills/seatable-php
 ```
-
-Or copy the folder manually:
+Or copy the folder manually
 
 ```bash
-cp -r seatable-php-skill ~/.claude/skills/seatable-php
+cp -r seatable-skill ~/.claude/skills/
 ```
+
+
 
 After installing, restart Claude Code (or start a new session) for the skill to become available.
 

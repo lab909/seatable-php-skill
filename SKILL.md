@@ -1,36 +1,14 @@
 ---
 name: seatable-php
 description: >
-    Use this skill whenever you are developing a PHP backend application that needs to use SeaTable as a database or data store. Triggers include any mention of SeaTable, requests to build a PHP API or backend that reads/writes structured data to SeaTable, setting up the SeaTable PHP SDK, performing CRUD operations on SeaTable bases, or integrating SeaTable into a Laravel/Slim/vanilla PHP project. If the user says "use SeaTable", "connect to SeaTable", "store data in SeaTable", or "query my SeaTable base", always use this skill immediately.
+  Use this skill whenever you are developing a PHP backend application that needs to use SeaTable as a database or data store. Triggers include any mention of SeaTable, requests to build a PHP API or backend that reads/writes structured data to SeaTable, setting up the SeaTable PHP SDK, performing CRUD operations on SeaTable bases, or integrating SeaTable into a Laravel/Slim/vanilla PHP project. If the user says "use SeaTable", "connect to SeaTable", "store data in SeaTable", or "query my SeaTable base", always use this skill immediately.
 ---
 
 # SeaTable PHP SDK Skill
 
-SeaTable is an Airtable-like cloud spreadsheet/database. This skill covers everything needed
-to build PHP backends that use SeaTable as a data store via the official `seatable/seatable-api-php`
-SDK (v4+, auto-generated from OpenAPI).
+SeaTable is an Airtable-like cloud spreadsheet/database. This skill covers everything needed to build PHP backends that use SeaTable as a data store via the official `seatable/seatable-api-php` SDK.
 
-> ⚠️ The SDK v4+ is **not compatible** with v0.2 or earlier. Always use the patterns documented here.
-> This document was validated against **SDK v6.0.10** on a self-hosted SeaTable instance.
-
----
-
-## Table of Contents
-
-1. [Installation](#1-installation)
-2. [Authentication](#2-authentication)
-3. [Security & Architecture Guardrails (CRITICAL)](#3-security--architecture-guardrails-critical)
-4. [Bootstrap Pattern](#4-bootstrap-pattern)
-5. [Return Type Reference — CRITICAL](#5-return-type-reference--critical)
-6. [Core CRUD Operations](#6-core-crud-operations)
-7. [Column Management](#7-column-management)
-8. [Reading Data — SQL vs listRows](#8-reading-data--sql-vs-listrows)
-9. [API Namespace Map](#9-api-namespace-map)
-10. [Self-Hosted Configuration](#10-self-hosted-configuration)
-11. [Error Handling & Retry Strategy](#11-error-handling--retry-strategy)
-12. [Project Structure](#12-project-structure)
-13. [Key Gotchas & Discoveries](#13-key-gotchas--discoveries)
-14. [SQL Reference](#14-sql-reference)
+> ⚠️ The current SDK (v4+) was auto-generated from OpenAPI and is **not compatible** with v0.2 or earlier. Always use the current API patterns documented here.
 
 ---
 
@@ -38,531 +16,483 @@ SDK (v4+, auto-generated from OpenAPI).
 
 ```bash
 composer require seatable/seatable-api-php
-# Optionally for .env support:
-composer require vlucas/phpdotenv
 ```
 
-Requires PHP 7.4+. The SDK depends on `guzzlehttp/guzzle` (auto-installed).
+Requires PHP 7.4+ and Composer. The SDK depends on `guzzlehttp/guzzle` (auto-installed).
 
 ---
 
-## 2. Authentication
+## 2. Authentication — Three Tokens
 
-SeaTable uses a three-token hierarchy:
+SeaTable uses a **three-token hierarchy**. Understanding this is essential:
 
 | Token | Length | Expires | Used for |
-| --- | --- | --- | --- |
-| **Account-Token** | 40 chars | Never | Account-level ops (list bases, manage users) |
-| **API-Token** | 40 chars | Never | Per-base password; exchanges for a Base-Token |
+|---|---|---|---|
+| **Account-Token** | 40 chars | Never | Account-level operations (list bases, manage users) |
+| **API-Token** | 40 chars | Never | Per-base password; generates a Base-Token |
 | **Base-Token** | 400+ chars (JWT) | **3 days** | All base CRUD operations |
 
-**For most apps, you only need an API-Token** (created in the SeaTable UI per base).
+**For most backend apps, you only need an API-Token** (created in the SeaTable UI per base). You exchange it for a Base-Token at runtime.
 
-```php
-use SeaTable\Client\Auth\BaseTokenApi;
-use SeaTable\Client\Configuration;
-use GuzzleHttp\Client as HttpClient;
-
-$config = Configuration::getDefaultConfiguration();
-$config->setAccessToken($_ENV['SEATABLE_API_TOKEN']);
-$config->setHost($_ENV['SEATABLE_SERVER_URL']); // required for self-hosted
-
-$authApi = new BaseTokenApi(new HttpClient(), $config);
-$result  = $authApi->getBaseTokenWithApiToken();
-
-// $result is an array:
-$baseUuid    = $result['dtable_uuid'];   // ← key is 'dtable_uuid', NOT 'base_uuid'
-$accessToken = $result['access_token'];
-```
-
-> ⚠️ Base-Tokens expire after 3 days. For long-running processes, implement refresh logic.
-> In request-scoped HTTP apps, fetching a fresh token per request is acceptable but adds
-> latency — consider short-lived caching (see [Section 4 — Token Caching](#token-caching)).
+All requests use: `Authorization: Bearer <token>`
 
 ---
 
-## 3. Security & Architecture Guardrails (CRITICAL)
+## 3. Project Setup Pattern
 
-When scaffolding or modifying code, you MUST adhere to these strict security and architectural rules.
+Always store credentials in environment variables, never hardcoded.
 
-### A. SQL Injection Prevention
-
-SeaTable allows SQL queries via its API, but it does NOT support parameterized SQL via the SDK's `querySQL` method.
-
-* **Requirement:** You must **never** concatenate raw user input directly into a SQL query string.
-* **Rule:** If you must construct SQL strings, rigorously sanitize, escape, and cast all inputs (e.g., `intval()` for integers, strict regex validation for strings with length limits) before appending them to the query.
-* **Prohibited:** `"SELECT * FROM Tasks WHERE status = '{$_POST['status']}'"`
-* **Safe pattern:**
-```php
-// Validate BEFORE interpolation — strict type + length constraints
-$status = $_POST['status'] ?? '';
-if (!in_array($status, ['todo', 'in_progress', 'done'], true)) {
-    throw new \InvalidArgumentException("Invalid status value.");
-}
-$sql = "SELECT * FROM Tasks WHERE status = '{$status}' LIMIT 100";
+**`.env` (or environment)**
+```
+SEATABLE_SERVER_URL=https://your-seatable-server.com
+SEATABLE_API_TOKEN=your_api_token_here
 ```
 
-### B. Input Validation & Mass Assignment Prevention
-
-* **Requirement:** Never take raw request payloads (`$_POST`, `$_GET`, or raw JSON input) and pass them directly to the SeaTable SDK's `appendRows` or `updateRow` methods.
-* **Rule:** Implement a strict allow-list of permitted columns. Validate all incoming data types, lengths, and formats before sending them to SeaTable.
-
-### C. Error Handling & Information Disclosure
-
-* **Requirement:** SeaTable API errors can leak sensitive Base UUIDs or table structures.
-* **Rule:** Catch `\SeaTable\Client\ApiException`. Log the detailed exception message and body internally, but **only return generic HTTP error responses** (e.g., `400 Bad Request` or `500 Internal Server Error`) to the API consumer.
-* **Rule:** Never log raw tokens. If logging the response body, be aware it may contain sensitive identifiers — sanitize before writing to shared log systems.
-
-### D. Environment Variables & Secrets
-
-* **Requirement:** Store all credentials in `.env` files using `vlucas/phpdotenv`.
-* **Rule:** Always add `.env` to `.gitignore` to prevent committing secrets to version control.
-* **Rule:** Provide a `.env.example` with placeholder values (committed to the repo) so developers know which variables are required.
-
-### E. The Repository Pattern & DTOs
-
-* **Requirement:** Do not scatter SeaTable API calls throughout controllers or routing files. Encapsulate all database interactions within Repository classes (e.g., `TaskRepository`).
-* **Requirement:** Map SeaTable's associative array responses into strongly typed PHP classes (Data Transfer Objects / DTOs) immediately upon retrieval. Repositories must return DTOs, not raw arrays or `stdClass` objects.
-* **Requirement:** Inject the SeaTable SDK classes (`RowsApi`, `ColumnsApi`) into Repositories via dependency injection for testability.
-
-### F. File Upload Security
-
-* **Requirement:** Before uploading files, always validate that the source file exists (`file_exists()`), sanitize the filename with `basename()`, and validate the file type/extension against an allow-list.
-* **Prohibited:** Passing user-supplied paths directly to `fopen()` without validation.
-
----
-
-## 4. Bootstrap Pattern
-
-Recommended shared bootstrap reused by all scripts and API endpoints:
-
+**Bootstrap / connection helper:**
 ```php
 <?php
-// src/SeaTableClient.php
+require_once(__DIR__ . '/vendor/autoload.php');
 
-require_once __DIR__ . '/../vendor/autoload.php';
-
-use Dotenv\Dotenv;
-use SeaTable\Client\Auth\BaseTokenApi;
-use SeaTable\Client\Base\BaseInfoApi;
-use SeaTable\Client\Base\ColumnsApi;
-use SeaTable\Client\Base\RowsApi;
-use SeaTable\Client\Configuration;
-use GuzzleHttp\Client as HttpClient;
-
-$dotenv = Dotenv::createImmutable(__DIR__ . '/..');
-$dotenv->load();
-
-function getAuth(): array
-{
-    $config = Configuration::getDefaultConfiguration();
+function getSeaTableBaseToken(): array {
+    $config = SeaTable\Client\Configuration::getDefaultConfiguration();
     $config->setAccessToken($_ENV['SEATABLE_API_TOKEN']);
-    $config->setHost($_ENV['SEATABLE_SERVER_URL']);
+    $config->setHost($_ENV['SEATABLE_SERVER_URL']);  // omit for cloud.seatable.io
 
-    $authApi = new BaseTokenApi(new HttpClient(), $config);
-    $result  = $authApi->getBaseTokenWithApiToken();
+    $authApi = new SeaTable\Client\Auth\BaseTokenApi(
+        new GuzzleHttp\Client(),
+        $config
+    );
+
+    $result = $authApi->getBaseTokenWithApiToken();
 
     return [
-        'base_uuid'    => $result['dtable_uuid'],  // ← SDK returns 'dtable_uuid'
+        'base_uuid'    => $result['dtable_uuid'],
         'access_token' => $result['access_token'],
+        'config'       => $config,
     ];
 }
 
-function makeConfig(array $auth): Configuration
-{
-    $config = Configuration::getDefaultConfiguration();
+function getRowsApi(array $auth): SeaTable\Client\Base\RowsApi {
+    $config = SeaTable\Client\Configuration::getDefaultConfiguration();
     $config->setAccessToken($auth['access_token']);
     $config->setHost($_ENV['SEATABLE_SERVER_URL']);
-    return $config;
-}
-
-function getRowsApi(array $auth): RowsApi
-{
-    return new RowsApi(new HttpClient(), makeConfig($auth));
-}
-
-function getColumnsApi(array $auth): ColumnsApi
-{
-    return new ColumnsApi(new HttpClient(), makeConfig($auth));
-}
-
-function getBaseInfoApi(array $auth): BaseInfoApi
-{
-    return new BaseInfoApi(new HttpClient(), makeConfig($auth));
+    return new SeaTable\Client\Base\RowsApi(new GuzzleHttp\Client(), $config);
 }
 ```
 
-### Token Caching
-
-For production apps that make many requests, avoid exchanging the API-Token on every call.
-Cache the Base-Token with a TTL shorter than its 3-day expiry (e.g., 2 days):
-
-```php
-/**
- * Get a cached Base-Token, refreshing only when expired.
- * Uses APCu for single-server setups. Replace with Redis/Memcached for multi-server.
- */
-function getAuthCached(): array
-{
-    $cacheKey = 'seatable_base_token';
-    $cached   = apcu_fetch($cacheKey);
-
-    if ($cached !== false) {
-        return $cached;
-    }
-
-    $auth = getAuth(); // fresh token exchange
-    apcu_store($cacheKey, $auth, 172800); // cache for 2 days (172800 seconds)
-
-    return $auth;
-}
-```
+> ⚠️ **Base-Tokens expire after 3 days.** In long-running apps (daemons, queues), implement token refresh logic. In request-scoped apps (HTTP APIs), fetching a fresh token per request is acceptable but adds latency — consider short-lived caching (e.g., APCu or Redis with a 2-day TTL).
 
 ---
 
-## 5. Return Type Reference — CRITICAL
+## 4. Core CRUD Operations
 
-> ⚠️ **This is the most important section.** The SDK returns inconsistent types across methods.
-> Getting this wrong causes silent failures (null instead of data) or fatal errors.
-
-### `BaseTokenApi::getBaseTokenWithApiToken()`
-
-* Returns: **plain PHP `array`**
-* Keys: `dtable_uuid`, `access_token`, `dtable_server`, `dtable_socket`, `dtable_db_server`, `workspace_id`, `dtable_name`
-* Access: `$result['dtable_uuid']`, `$result['access_token']`
-
-### `BaseInfoApi::getMetadata($uuid)`
-
-* Returns: **`array`** at the top level
-* But `$result['metadata']` is a **`stdClass` object** — NOT an array
-* Access pattern:
+### Read — SQL Query (recommended for flexibility)
 ```php
-$meta      = $baseInfoApi->getMetadata($uuid);
-// ✓ correct:
-$tables    = $meta['metadata']->tables;        // array of stdClass
-$tableName = $meta['metadata']->tables[0]->name; // string
-// ✗ wrong — throws "Cannot use object of type stdClass as array":
-$tables    = $meta['metadata']['tables'];
+$auth = getSeaTableBaseToken();
+$rowsApi = getRowsApi($auth);
+
+$query = new SeaTable\Client\Base\SqlQuery([
+    'sql'          => "SELECT * FROM Users WHERE active = 1 LIMIT 100",
+    'convert_keys' => true,   // use column names as keys instead of internal keys
+]);
+
+$result = $rowsApi->querySQL($auth['base_uuid'], $query);
+// $result->getResults() returns an array of row objects/arrays
 ```
 
-### `RowsApi::querySQL($uuid, SqlQuery $query)`
+> **`convert_keys`:** Use `true` to get human-readable column names (e.g. `cover_image`). Use `false` to get internal 4-char keys (e.g. `XX8w`) — required when column display names contain spaces or special characters that break SQL.
 
-* Returns: **`SqlQueryResponse` object** (typed PHP class)
-* Must use **getter methods** — direct property access and array access both return null:
+### Read — List Rows (paginated)
 ```php
-$response = $rowsApi->querySQL($uuid, $query);
-// ✓ correct:
-$rows = $response->getResults();   // array of associative arrays
-$meta = $response->getMetadata();  // array of column metadata objects
-$ok   = $response->getSuccess();   // bool
-// ✗ wrong — returns null (no exception in PHP 8, silent failure):
-$rows = $response->results;
-$rows = $response['results'];
+$result = $rowsApi->listRows($auth['base_uuid'], 'YourTableName');
+// Optional params: view_name, limit, start (for pagination)
 ```
 
-* Each row in `getResults()` is an **associative array** (when `convert_keys: true`):
+### Create — Append Rows
 ```php
-$rows[0]['name']         // string
-$rows[0]['phone number'] // string (column names with spaces work fine)
-$rows[0]['_id']          // string — the row ID
-```
-
-### `RowsApi::listRows($uuid, $tableName, ...)`
-
-* Returns: **`array`** at the top level
-* `$result['rows']` is an **`array`** of **`stdClass` objects**
-* Access pattern:
-```php
-$result = $rowsApi->listRows($uuid, 'TableName', null, 0, 100);
-$rows   = $result['rows'];     // array of stdClass
-$id     = $rows[0]->_id;      // ✓ object property access
-$id     = $rows[0]['_id'];    // ✗ wrong
-```
-
-* ⚠️ **`convert_keys` has NO effect** in `listRows` — rows always use internal column keys
-  (e.g. `"pDkj"` for a column named `"name"`). See [Section 8](#8-reading-data--sql-vs-listrows).
-
-### `ColumnsApi::listColumns($tableName, $uuid)`
-
-* Returns: **`array`** at top level
-* `$result['columns']` is an **`array`** of **`stdClass` objects**
-* Each column has properties: `->key`, `->name`, `->type`, `->width`, `->editable`, `->resizable`
-```php
-$result  = $columnsApi->listColumns($tableName, $uuid);
-$columns = $result['columns'];
-$name    = $columns[0]->name;   // ✓ stdClass property
-$name    = $columns[0]['name']; // ✗ wrong
-```
-
-* ⚠️ Note the **reversed parameter order**: `listColumns($table_name, $base_uuid)` — table first, UUID second.
-  Most other API methods have `($uuid, ...)` as the first parameter.
-
----
-
-## 6. Core CRUD Operations
-
-### Insert rows
-
-```php
-use SeaTable\Client\Base\AppendRows;
-
-$request = new AppendRows([
-    'table_name' => 'Contacts',
-    'rows'       => [
-        ['name' => 'Alice', 'surname' => 'Smith', 'phone number' => '+1 555 123 4567'],
-        ['name' => 'Bob',   'surname' => 'Jones',  'phone number' => '+44 20 7946 0958'],
+$request = new SeaTable\Client\Base\AppendRows([
+    'table_name'    => 'Users',
+    'rows'          => [
+        ['Name' => 'Alice', 'Email' => 'alice@example.com', 'Active' => true],
+        ['Name' => 'Bob',   'Email' => 'bob@example.com',   'Active' => false],
     ],
+    'apply_default' => true,  // apply column default values
 ]);
 
-$rowsApi->appendRows($uuid, $request);
+$result = $rowsApi->appendRows($auth['base_uuid'], $request);
 ```
 
-Insert rows use **column names** (not internal keys) as array keys.
-
-### Read rows via SQL (recommended)
-
-```php
-use SeaTable\Client\Base\SqlQuery;
-
-$query = new SqlQuery([
-    'sql'          => "SELECT name, surname, `phone number` FROM Contacts LIMIT 10 OFFSET 0",
-    'convert_keys' => true,
-]);
-
-$response = $rowsApi->querySQL($uuid, $query);
-$rows     = $response->getResults(); // array of assoc arrays with column names as keys
-```
-
-### Read rows via listRows (for fetching row IDs / full pagination)
-
-```php
-$start  = 0;
-$limit  = 1000;
-$rowIds = [];
-
-do {
-    $result = $rowsApi->listRows($uuid, 'Contacts', null, $start, $limit);
-    $chunk  = $result['rows'] ?? [];
-    foreach ($chunk as $row) {
-        $rowIds[] = $row->_id;  // stdClass — use -> not []
-    }
-    $start += $limit;
-} while (count($chunk) === $limit);
-```
-
-### Update rows
-
-```php
-use SeaTable\Client\Base\UpdateRows;
-
-$request = new UpdateRows([
-    'table_name' => 'Contacts',
-    'updates'    => [
-        [
-            'row_id' => 'THE_ROW_ID',
-            'row'    => ['name' => 'Alice Updated', 'surname' => 'Smith-Jones'],
-        ],
-    ],
-]);
-
-$rowsApi->updateRow($uuid, $request);
-```
-
-### Delete rows
-
-```php
-use SeaTable\Client\Base\DeleteRows;
-
-$request = new DeleteRows([
-    'table_name' => 'Contacts',
-    'row_ids'    => ['ROW_ID_1', 'ROW_ID_2', 'ROW_ID_3'],
-]);
-
-$rowsApi->deleteRow($uuid, $request);
-```
-
----
-
-## 7. Column Management
-
-### List columns
-
-```php
-// ⚠️ Parameter order: table_name FIRST, then base_uuid
-$result  = $columnsApi->listColumns($tableName, $uuid);
-$columns = $result['columns']; // array of stdClass objects
-```
-
-### Insert a single column
-
-```php
-use SeaTable\Client\Base\InsertColumnRequest;
-
-$req = new InsertColumnRequest([
-    'table_name'  => 'Contacts',
-    'column_name' => 'phone number',
-    'column_type' => 'text',
-]);
-
-$columnsApi->insertColumn($uuid, $req);
-```
-
----
-
-## 8. Reading Data — SQL vs listRows
-
-### Use `querySQL` when you need:
-
-* **Human-readable column names** in results
-* Filtered results (`WHERE` clause)
-* Sorted results (`ORDER BY`)
-* Paginated reads for display (use `LIMIT N OFFSET M`)
-
-**SQL default row limit**: SeaTable caps SQL results at **100 rows** by default. Always add explicit `LIMIT N`.
-
-### Use `listRows` when you need:
-
-* **All rows** without a row-count cap
-* Only the row `_id` values (e.g. to batch-delete everything)
-
-> ⚠️ **`convert_keys` does NOT work in `listRows`**. Rows always come back with internal keys like `"pDkj"`. **Only `querySQL` reliably returns human-readable column names.**
-
----
-
-## 9. API Namespace Map
-
-| Task | Class | Namespace |
-| --- | --- | --- |
-| Exchange API-Token → Base-Token | `BaseTokenApi` | `SeaTable\Client\Auth` |
-| Base metadata (tables, columns) | `BaseInfoApi` | `SeaTable\Client\Base` |
-| Row CRUD + SQL queries | `RowsApi` | `SeaTable\Client\Base` |
-| Column management | `ColumnsApi` | `SeaTable\Client\Base` |
-| Table management | `TablesApi` | `SeaTable\Client\Base` |
-| File uploads/downloads | `FilesApi` | `SeaTable\Client\File` |
-| Row-to-row links | `LinksApi` | `SeaTable\Client\Base` |
-| Account info, list bases | `UserApi`, `BasesApi` | `SeaTable\Client\User` |
-
----
-
-## 10. Self-Hosted Configuration
-
-For self-hosted SeaTable instances, **always call `$config->setHost()`**.
-
-```php
-$config = Configuration::getDefaultConfiguration();
-$config->setAccessToken($token);
-$config->setHost('https://your-seatable-server.com'); // no trailing slash, no path suffix
-```
-
-The host should be the root URL only. Without `setHost()`, the SDK defaults to `https://cloud.seatable.io`.
-
-> ⚠️ **TLS/SSL:** Never disable SSL verification in production (`['verify' => false]`). If your
-> self-hosted instance uses a custom CA, configure Guzzle to trust it explicitly:
+> ⚠️ **Extracting the new row ID:** `appendRows()` returns `row_ids` as an array of `stdClass` objects (not plain strings). Always extract `_id` defensively:
 > ```php
-> $httpClient = new HttpClient(['verify' => '/path/to/custom-ca-bundle.crt']);
+> $responseArray = is_array($result) ? $result : (array) $result;
+> $raw    = $responseArray['row_ids'][0] ?? '';
+> $rowId  = is_array($raw) ? ($raw['_id'] ?? '') : (is_object($raw) ? $raw->_id : (string) $raw);
 > ```
 
+### Update — Update Row(s)
+```php
+use SeaTable\Client\Base\UpdateRows;
+use SeaTable\Client\Base\UpdateRowsUpdatesInner;
+
+$request = new UpdateRows([
+    'table_name' => 'Users',
+    'updates'    => [
+        new UpdateRowsUpdatesInner([
+            'row_id' => 'THE_ROW_ID',
+            'row'    => (object)['Active' => false, 'Name' => 'Alice Updated'],
+        ]),
+    ],
+]);
+
+$rowsApi->updateRow($auth['base_uuid'], $request);
+```
+
+> ⚠️ **Critical: use `UpdateRows` + `UpdateRowsUpdatesInner`, not `UpdateRow`.** The SDK has a similarly-named `UpdateRow` model (singular) that generates a flat `{table_name, row_id, row}` payload. The API accepts this silently and returns `{"success":true}` — but **never applies the update**. Only the `updates` array format works. This is one of the most dangerous silent bugs in the SDK.
+
+### Delete — Delete Row(s)
+```php
+$request = new SeaTable\Client\Base\DeleteRows([
+    'table_name' => 'Users',
+    'row_ids'    => ['ROW_ID_1', 'ROW_ID_2'],
+]);
+
+$rowsApi->deleteRow($auth['base_uuid'], $request);
+```
+
+> ⚠️ **Use `DeleteRows` (plural) with `row_ids` array, not `DeleteRow` (singular) with `row_id`.** Same silent-failure issue as `UpdateRow` — the API accepts `DeleteRow` and returns success without deleting anything.
+
+### Get Single Row
+```php
+$row = $rowsApi->getRow($auth['base_uuid'], 'Users', $rowId);
+```
+
+> Note: `getRow()` may have strict `row_id` validation in some SDK versions. If it throws unexpectedly, use SQL instead: `SELECT * FROM Users WHERE _id='...' LIMIT 1`
+
 ---
 
-## 11. Error Handling & Retry Strategy
+## 5. API Namespace Map
 
-### Basic error handling
+The SDK is split into namespaces. Always use the correct one:
+
+| Task | Class | Namespace |
+|---|---|---|
+| Exchange API-Token for Base-Token | `BaseTokenApi` | `SeaTable\Client\Auth` |
+| Get account info, list bases | `UserApi`, `BasesApi` | `SeaTable\Client\User` |
+| Base metadata | `BaseInfoApi` | `SeaTable\Client\Base` |
+| Row CRUD + SQL | `RowsApi` | `SeaTable\Client\Base` |
+| Column management | `ColumnsApi` | `SeaTable\Client\Base` |
+| Table management | `TablesApi` | `SeaTable\Client\Base` |
+| File upload/download | `FilesApi` | `SeaTable\Client\File` |
+| Links between rows | `LinksApi` | `SeaTable\Client\Base` |
+
+Full endpoint lists: see `references/api-endpoints.md`
+
+---
+
+## 6. Self-Hosted Server Configuration
+
+Since the user has a **self-hosted SeaTable instance**, always call `$config->setHost(...)`. Without it the SDK defaults to `https://cloud.seatable.io`.
+
+```php
+$config = SeaTable\Client\Configuration::getDefaultConfiguration();
+$config->setAccessToken($token);
+$config->setHost('https://your-seatable-server.com');  // ← always required for self-hosted
+```
+
+The host should be the root URL with no trailing slash and no path suffix.
+
+---
+
+## 7. Error Handling
+
+All SDK calls throw exceptions on failure. Always wrap in try/catch:
 
 ```php
 try {
-    $result = $rowsApi->appendRows($uuid, $request);
+    $result = $rowsApi->appendRows($auth['base_uuid'], $request);
 } catch (\SeaTable\Client\ApiException $e) {
-    $code = $e->getCode();
-    $body = $e->getResponseBody();
-
-    // CRITICAL: Log internally, do not leak $body to API consumers.
-    // Be aware $body may contain Base UUIDs or table structure details.
+    $code    = $e->getCode();           // HTTP status code
+    $body    = $e->getResponseBody();   // Raw response body
+    $headers = $e->getResponseHeaders();
+    // Log and handle: 401 = token expired/invalid, 403 = no permission,
+    // 404 = base/table not found, 429 = rate limited
     error_log("SeaTable API error [{$code}]: {$body}");
-
-    // Return a generic error to the caller
-    throw new \RuntimeException("Database operation failed.");
-}
-```
-
-### Handling rate limits (HTTP 429) and token expiry (HTTP 401)
-
-```php
-function executeWithRetry(callable $operation, int $maxRetries = 3): mixed
-{
-    $attempt = 0;
-
-    while (true) {
-        try {
-            return $operation();
-        } catch (\SeaTable\Client\ApiException $e) {
-            $code = $e->getCode();
-            $attempt++;
-
-            // 401 = token expired — refresh and retry once
-            if ($code === 401 && $attempt === 1) {
-                error_log("SeaTable: Base-Token expired, refreshing...");
-                // Caller should refresh auth and rebuild the API client
-                throw new TokenExpiredException("Base-Token expired, refresh required.");
-            }
-
-            // 429 = rate limited — exponential backoff
-            if ($code === 429 && $attempt <= $maxRetries) {
-                $waitSeconds = min(pow(2, $attempt), 30); // 2s, 4s, 8s... max 30s
-                error_log("SeaTable: Rate limited, waiting {$waitSeconds}s (attempt {$attempt}/{$maxRetries})");
-                sleep($waitSeconds);
-                continue;
-            }
-
-            // All other errors or max retries exceeded
-            error_log("SeaTable API error [{$code}]: " . $e->getResponseBody());
-            throw new \RuntimeException("Database operation failed.");
-        }
-    }
+    throw $e;
 }
 ```
 
 ---
 
-## 12. Project Structure
-
-When scaffolding projects, enforce this directory structure to support DTOs and Repositories:
+## 8. Typical Project Structure
 
 ```
 my-backend/
 ├── composer.json
-├── .env                       # SEATABLE_SERVER_URL, SEATABLE_API_TOKEN (never committed)
-├── .env.example               # Template with placeholder values (committed to repo)
-├── .gitignore                 # Must include: .env, /vendor/
+├── .env                      # SEATABLE_SERVER_URL, SEATABLE_API_TOKEN
 ├── src/
-│   ├── SeaTableClient.php     # Bootstrap API Client setup
-│   ├── DTOs/
-│   │   └── ContactDTO.php     # Strongly typed representation of a row
-│   └── Repositories/
-│       └── ContactRepository.php # Encapsulates all RowsApi calls, returns ContactDTOs
-├── api/
-│   └── contacts.php           # JSON endpoint (validates input, calls Repository)
-└── index.php
+│   ├── SeaTable/
+│   │   ├── Client.php        # bootstrap helper (getBaseToken, getRowsApi, etc.)
+│   │   └── Repository/
+│   │       ├── UserRepository.php
+│   │       └── OrderRepository.php
+│   └── ...
+└── vendor/
 ```
 
-> ⚠️ **Always create a `.gitignore`** that excludes `.env` and `/vendor/`. See `examples/.gitignore`
-> for a ready-to-use template.
-
-Always use the Repository pattern and DTOs. Refer to the files in `examples/ContactRepository.php` and `examples/ContactDTO.php` for the required implementation style, security checks, and error handling.
+A **Repository pattern** is recommended: each SeaTable table gets its own repository class that internally uses the SDK, keeping CRUD logic out of controllers/handlers.
 
 ---
 
-## 13. Key Gotchas & Discoveries
+## 9. Key Gotchas
 
-* **Return type inconsistency**: Some methods return arrays, some return objects, some return arrays of objects. Always check Section 5.
-* **`listColumns` parameters**: `listColumns($tableName, $uuid)` — table name first, UUID second.
-* **`DeleteColumn` key**: Uses `'column'`, not `'column_name'`.
-* **SQL column quoting**: Use backticks around column names containing spaces: `` SELECT `phone number` FROM Contacts ``
-* **`getBaseTokenWithApiToken` key**: The UUID is returned as `dtable_uuid`, not `base_uuid`.
-* **Table names in SQL**: When building SQL, only use hardcoded or validated table names — never raw user input. Mark table name sources clearly with comments in code.
-* **Self-hosted TLS**: Do not disable SSL verification. Use a custom CA bundle if needed.
+- **`convert_keys: true`** in SQL queries maps SeaTable's internal column keys to human-readable column names — almost always what you want.
+- Row IDs (`_id`) are returned in query results; store them if you need to update/delete later.
+- SeaTable column names are case-sensitive.
+- The `apply_default` flag in `AppendRows` controls whether default column values are applied.
+- For **file uploads**, use `FilesApi::getUploadLink()` first to get a signed URL, then POST the file to that URL — the SDK does not upload the file directly.
+- SeaTable SQL supports `SELECT`, `INSERT`, `UPDATE`, `DELETE` but is not full SQL — check `references/sql-limitations.md` for what's supported.
 
 ---
 
-## 14. SQL Reference
+## 10. Known Silent Bugs (SDK v4+)
 
-See `references/sql-limitations.md` for the full SQL dialect reference.
+These issues return `{"success":true}` with no error but do nothing. They are the most dangerous bugs to encounter.
+
+| Wrong model | Correct model | Effect of wrong |
+|---|---|---|
+| `UpdateRow` | `UpdateRows` + `UpdateRowsUpdatesInner` | Update accepted silently, `_mtime` never changes, data not updated |
+| `DeleteRow` | `DeleteRows` with `row_ids` array | Delete accepted silently, row still exists |
+
+**Debugging tip:** After any `updateRow()` call, query `_mtime` on the row. If it hasn't changed, you used the wrong model.
+
+---
+
+## 11. Column Type Reference
+
+Different column types require different value formats. Getting these wrong causes silent failures or data that stores but doesn't render.
+
+### Image columns (`type: image`)
+
+```php
+// ✅ Correct — plain array of full absolute URL strings
+'cover_image' => ['https://your-host.com/workspace/1/asset/uuid/images/2024-03/photo.jpg']
+
+// ❌ Wrong — {name, url} object format (stores in API but image won't render in UI)
+'cover_image' => [['name' => 'photo.jpg', 'url' => '/workspace/1/asset/...']]
+
+// ❌ Wrong — relative URL (won't render)
+'cover_image' => ['/workspace/1/asset/uuid/images/2024-03/photo.jpg']
+```
+
+The full URL must include the scheme and host: `https://your-seatable-server.com/workspace/{workspace_id}/asset/{base_uuid}/images/{year-month}/{filename}`
+
+### File columns (`type: file`)
+
+```php
+// ✅ Correct for file columns — {name, url} object array
+'attachment' => [['name' => 'doc.pdf', 'url' => '/workspace/1/asset/uuid/files/2024-03/doc.pdf']]
+```
+
+> **Image vs File columns have opposite formats.** Image columns take plain URL strings; file columns take `{name, url}` objects.
+
+### Link columns (`type: link` — "Link to other records")
+
+Link columns cannot be set via `updateRow()`. They must be managed through `LinksApi`. See Section 12.
+
+### Text, number, boolean, date columns
+
+Standard PHP scalar values — no surprises.
+
+---
+
+## 12. Link Columns (Row-to-Row Relationships)
+
+Link columns ("Link to other records") require `LinksApi`, not `RowsApi`. You need the internal `table_id`, `other_table_id`, and `link_id` — all 4-character internal identifiers discoverable via `BaseInfoApi::getMetadata()`.
+
+```php
+use SeaTable\Client\Base\LinksApi;
+use SeaTable\Client\Base\RowLinkCreateUpdateDelete;
+
+$linksConfig = (new Configuration())->setAccessToken($baseToken);
+if (!empty($_ENV['SEATABLE_HOST'])) $linksConfig->setHost($_ENV['SEATABLE_HOST']);
+$linksApi = new LinksApi(new GuzzleClient(), $linksConfig);
+
+$request = new RowLinkCreateUpdateDelete([
+    'table_id'           => 'Ab12',        // 4-char ID of the source table
+    'other_table_id'     => 'Cd34',        // 4-char ID of the target table
+    'link_id'            => 'Ef56',        // 4-char link_id of the column
+    'other_rows_ids_map' => [
+        $sourceRowId => [$targetRowId],    // map: one source row → array of target row IDs
+    ],
+]);
+
+$linksApi->createRowLink($baseUuid, $request);
+```
+
+**How to discover table IDs and link IDs:**
+
+```php
+$baseInfoApi = new SeaTable\Client\Base\BaseInfoApi(new GuzzleClient(), $config);
+$metadata    = $baseInfoApi->getMetadata($baseUuid);
+// Inspect $metadata['tables'] → each table has 'id' (4-char) and 'columns'
+// Link columns have 'type' === 'link' and a 'data' object containing 'link_id'
+```
+
+Run this once per project and hardcode the IDs in `.env` — they don't change.
+
+**Lookup-or-create pattern** (e.g. for a categories table):
+
+```php
+function lookupOrCreateRow(RowsApi $rowsApi, string $baseUuid, string $table, string $nameCol, string $value): string {
+    // 1. Try to find existing row
+    $sql    = sprintf("SELECT _id FROM %s WHERE %s='%s' LIMIT 1", $table, $nameCol, addslashes($value));
+    $result = $rowsApi->querySQL($baseUuid, new SqlQuery(['sql' => $sql, 'convert_keys' => false]));
+    $rows   = $result->getResults();
+
+    if (!empty($rows)) {
+        $row = is_array($rows[0]) ? $rows[0] : (array) $rows[0];
+        return $row['_id'];
+    }
+
+    // 2. Create if not found
+    $insert = $rowsApi->appendRows($baseUuid, new AppendRows([
+        'table_name' => $table,
+        'rows'       => [[$nameCol => $value]],
+    ]));
+    $res    = is_array($insert) ? $insert : (array) $insert;
+    $raw    = $res['row_ids'][0] ?? '';
+    // row_ids[0] is a stdClass object, not a plain string
+    return is_array($raw) ? ($raw['_id'] ?? '') : (is_object($raw) ? $raw->_id : (string) $raw);
+}
+```
+
+---
+
+## 13. Reusable Client Template
+
+A ready-to-use `SeaTableClient.php` is available at `templates/SeaTableClient.php`.
+
+**Copy it into any new project:**
+
+```bash
+cp ~/.claude/skills/seatable-php/templates/SeaTableClient.php src/SeaTableClient.php
+```
+
+Then adjust the namespace at the top to match your project.
+
+**What it provides:**
+
+| Method | Description |
+|---|---|
+| `connect()` | Auth token exchange + initialise all API clients |
+| `query(string $sql, bool $convertKeys)` | SQL query → array of rows |
+| `insertRow(string $table, array $data)` | Append row, return `_id` (handles stdClass extraction) |
+| `updateRow(string $table, string $rowId, array $fields)` | Safe update via `UpdateRows` plural model |
+| `deleteRows(string $table, array $rowIds)` | Batched delete via `DeleteRows` plural model |
+| `clearTable(string $table)` | Delete all rows (useful for test resets) |
+| `uploadImage(string $localPath, string $fileName)` | Upload file, return full absolute URL |
+| `patchImageColumn(string $table, string $rowId, string $column, string $url)` | Set image column to uploaded URL |
+| `lookupOrCreate(string $table, string $nameCol, string $value)` | Find or create row, return `_id` |
+| `linkRows(...)` | Link two rows via a "Link to other records" column |
+| `getMetadata()` | Return all tables + columns for discovering internal IDs |
+
+**Minimum `.env` keys required:**
+
+```env
+SEATABLE_HOST=https://your-seatable-server.com
+SEATABLE_API_TOKEN=your_40_char_token
+SEATABLE_BASE_UUID=your-base-uuid
+```
+
+**Quickstart example:**
+
+```php
+$client = new SeaTableClient();
+$client->connect();
+
+// Insert a row
+$rowId = $client->insertRow('Products', ['name' => 'Widget', 'price' => 9.99]);
+
+// Upload an image and attach it
+$url = $client->uploadImage('/tmp/photo.jpg', 'widget.jpg');
+$client->patchImageColumn('Products', $rowId, 'cover_image', $url);
+
+// Link to a category (lookup-or-create)
+$catId = $client->lookupOrCreate('categories', 'category', 'Hardware');
+$client->linkRows($rowId, $catId, $linkId, $productsTableId, $categoriesTableId);
+```
+
+**Discover table IDs and link IDs** — use the ready-made script (see Section 14).
+
+---
+
+## 14. New Project Checklist
+
+Follow these steps at the start of every new SeaTable PHP project:
+
+**Step 1 — Copy the reusable client:**
+```bash
+cp ~/.claude/skills/seatable-php/templates/SeaTableClient.php src/SeaTableClient.php
+```
+Adjust the namespace at the top to match your project.
+
+**Step 2 — Set up `.env`:**
+```bash
+cp ~/.claude/skills/seatable-php/templates/.env.example .env
+```
+Fill in `SEATABLE_HOST`, `SEATABLE_API_TOKEN`, and `SEATABLE_BASE_UUID`. Leave the `TABLE_ID_*` / `LINK_ID_*` lines commented out for now — Step 4 generates those.
+
+**Step 3 — Test the connection before writing any feature code:**
+```bash
+cp ~/.claude/skills/seatable-php/templates/test-connection.php test-connection.php
+php test-connection.php
+```
+
+Expected output:
+```
+[OK] All required .env keys present
+[OK] Connected to SeaTable (token exchanged successfully)
+[OK] Base reachable — 3 table(s) found
+     - audiobooks  (42 rows)
+     - categories  (0 rows)
+[OK] All checks passed — ready to build!
+```
+
+If this step fails, fix the credentials before proceeding. Do not start implementing features against broken credentials.
+
+**Step 4 — Run the discovery script** (required if your schema has any link columns):
+```bash
+cp ~/.claude/skills/seatable-php/templates/discover-ids.php discover-ids.php
+php discover-ids.php
+```
+
+The script prints all table IDs, column keys, and link IDs in `.env`-ready format, e.g.:
+```
+TABLE_ID_AUDIOBOOKS=Ab12
+TABLE_ID_CATEGORIES=Cd34
+LINK_ID_CATEGORIES=Ef56
+```
+
+Copy those values into `.env`, then delete `discover-ids.php`.
+
+**Step 4 — Hardcode the IDs** in your application code (or load from `.env`):
+```php
+$client->linkRows($sourceRowId, $targetRowId,
+    $_ENV['LINK_ID_CATEGORIES'],
+    $_ENV['TABLE_ID_AUDIOBOOKS'],
+    $_ENV['TABLE_ID_CATEGORIES'],
+);
+```
+
+> ⚠️ **Never skip Step 3 if you have link columns.** The IDs are not guessable. Attempting to wire link columns without running the discovery script leads to silent failures that are hard to debug.
+
+---
+
+## Reference Files
+
+- `references/api-endpoints.md` — Full list of all available API classes and methods
+- `references/sql-limitations.md` — SeaTable SQL dialect notes and supported functions
+- `templates/SeaTableClient.php` — Reusable client class (copy into new projects)
+- `templates/.env.example` — All required `.env` keys with comments (copy to project root)
+- `templates/test-connection.php` — Verify credentials and list tables before building
+- `templates/discover-ids.php` — One-off script to print all table/link IDs in `.env` format
